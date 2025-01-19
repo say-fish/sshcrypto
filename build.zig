@@ -10,7 +10,6 @@ const Allocator = std.mem.Allocator;
 
 const PERF_EVENTS: []const u8 = "cache-references,cache-misses,cycles,instructions,branches,faults,migrations";
 
-// FIXME:
 const TEST_ASSETS_PATH: []const u8 = "assets/";
 
 const TestAssets = ArrayList(Tuple(&.{ []u8, []u8 }));
@@ -19,7 +18,10 @@ const TestAssets = ArrayList(Tuple(&.{ []u8, []u8 }));
 fn get_test_assets(allocator: std.mem.Allocator, path: []const u8) !TestAssets {
     var ret = ArrayList(Tuple(&.{ []u8, []u8 })).init(allocator);
 
-    var assets = try std.fs.cwd().openDir(path, .{ .iterate = true });
+    var assets = if (std.fs.path.isAbsolute(path))
+        try std.fs.openDirAbsolute(path, .{ .iterate = true })
+    else
+        try std.fs.cwd().openDir(path, .{ .iterate = true });
     defer assets.close();
 
     var walker = try assets.walk(allocator);
@@ -40,6 +42,22 @@ fn get_test_assets(allocator: std.mem.Allocator, path: []const u8) !TestAssets {
     }
 
     return ret;
+}
+
+fn add_assets(b: *std.Build, cmp: *std.Build.Step.Compile, assets: *const TestAssets) void {
+    for (assets.items) |asset| {
+        const name, const file = asset;
+
+        cmp.root_module.addAnonymousImport(
+            name,
+            .{
+                .root_source_file = if (std.fs.path.isAbsolute(file))
+                    .{ .cwd_relative = file }
+                else
+                    b.path(file),
+            },
+        );
+    }
 }
 
 const Test = struct {
@@ -72,18 +90,67 @@ fn add_test(b: *std.Build, step: *std.Build.Step, t: Test) !void {
     if (t.mod) |mod|
         test_case.root_module.addImport(t.mod_name.?, mod);
 
-    if (t.assets) |assets| for (assets.items) |cert| {
-        const name, const file = cert;
-        test_case.root_module.addAnonymousImport(
-            name,
-            .{ .root_source_file = b.path(file) },
-        );
-    };
+    if (t.assets) |assets|
+        add_assets(b, test_case, assets);
 
     var run_test_case = b.addRunArtifact(test_case);
     run_test_case.has_side_effects = true;
 
     step.dependOn(&run_test_case.step);
+}
+
+const PerfOpt = enum { @"verify-cert", @"verify-sig", cert, sk, pk, sig, all };
+
+const Perf = struct {
+    target: std.Build.ResolvedTarget,
+    opt: PerfOpt,
+
+    mod: ?*std.Build.Module = null,
+    mod_name: ?[]const u8 = null,
+
+    use_llvm: bool,
+    use_lld: bool,
+
+    record: bool,
+
+    assets: ?*const TestAssets = null,
+};
+
+fn add_perf(b: *std.Build, step: *std.Build.Step, perf: Perf) !void {
+    const perf_file = b.fmt("perf/{s}.zig", .{@tagName(perf.opt)});
+
+    const perf_exe = b.addExecutable(.{
+        .name = b.fmt("perf: {s}", .{@tagName(perf.opt)}),
+        .root_source_file = b.path(perf_file),
+        .target = perf.target,
+        .use_lld = perf.use_lld,
+        .use_llvm = perf.use_llvm,
+        .omit_frame_pointer = true,
+        .optimize = .ReleaseFast,
+    });
+
+    if (perf.mod) |mod|
+        perf_exe.root_module.addImport(perf.mod_name.?, mod);
+
+    if (perf.assets) |assets|
+        add_assets(b, perf_exe, assets);
+
+    const run_perf = if (perf.record)
+        b.addSystemCommand(&.{ "perf", "record", "-e", PERF_EVENTS, "-d", "--" })
+    else
+        b.addSystemCommand(&.{ "perf", "stat", "-d", "--" });
+
+    const emit_assembly = b.addWriteFiles();
+    _ = emit_assembly.addCopyFile(
+        perf_exe.getEmittedAsm(),
+        b.fmt("{s}.asm", .{@tagName(perf.opt)}),
+    );
+
+    run_perf.has_side_effects = true;
+    run_perf.addArtifactArg(perf_exe);
+
+    step.dependOn(&run_perf.step);
+    step.dependOn(&emit_assembly.step);
 }
 
 pub fn build(b: *std.Build) void {
@@ -108,7 +175,12 @@ pub fn build(b: *std.Build) void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     arena.deinit();
 
-    const assets = get_test_assets(arena.allocator(), TEST_ASSETS_PATH) catch
+    const assets_path = if (b.build_root.path) |path|
+        std.fs.path.join(arena.allocator(), &[_][]const u8{ path, TEST_ASSETS_PATH }) catch @panic("OOM")
+    else
+        null;
+
+    const assets = get_test_assets(arena.allocator(), assets_path orelse TEST_ASSETS_PATH) catch
         @panic("Fail to get test certs");
 
     const test_step = b.step("test", "Run unit tests");
@@ -204,52 +276,42 @@ pub fn build(b: *std.Build) void {
 
     const perf_step = b.step("perf", "Perf record");
     {
-        const Names = enum { @"verify-cert", @"verify-sig", cert, sk, pk, sig };
+        const opt =
+            b.option(PerfOpt, "perf", "Perf to run (default: key)") orelse .all;
 
-        const perf_opt =
-            b.option(Names, "perf", "Perf to run (default: key)") orelse .sk;
-
-        const perf_record =
+        const record =
             b.option(bool, "record", "Perf record?") orelse false;
 
-        const perf_file = b.fmt("perf/{s}.zig", .{@tagName(perf_opt)});
+        if (opt == .all) {
+            if (record) @panic("-Drecord cannot be used with -Dperf=all");
 
-        const perf_exe = b.addExecutable(.{
-            .name = b.fmt("perf: {s}", .{@tagName(perf_opt)}),
-            .root_source_file = b.path(perf_file),
-            .target = target,
-            .use_lld = lld,
-            .use_llvm = llvm,
-            .omit_frame_pointer = true,
-            .optimize = .ReleaseFast,
-        });
+            @setEvalBranchQuota(2000);
+            inline for (comptime std.meta.fields(PerfOpt)) |field| {
+                comptime if (std.mem.eql(u8, "all", field.name)) continue;
 
-        perf_exe.root_module.addImport("zssh", mod);
-
-        for (assets.items) |cert| {
-            const name, const file = cert;
-            perf_exe.root_module.addAnonymousImport(
-                name,
-                .{ .root_source_file = b.path(file) },
-            );
+                add_perf(b, perf_step, .{
+                    .assets = &assets,
+                    .mod = mod,
+                    .mod_name = "zssh",
+                    .opt = comptime std.meta.stringToEnum(PerfOpt, field.name).?,
+                    .record = false,
+                    .target = target,
+                    .use_lld = lld,
+                    .use_llvm = llvm,
+                }) catch @panic("OOM");
+            }
+        } else {
+            add_perf(b, perf_step, .{
+                .assets = &assets,
+                .mod = mod,
+                .mod_name = "zssh",
+                .opt = opt,
+                .record = record,
+                .target = target,
+                .use_lld = lld,
+                .use_llvm = llvm,
+            }) catch @panic("OOM");
         }
-
-        const run_perf = if (perf_record)
-            b.addSystemCommand(&.{ "perf", "record", "-e", PERF_EVENTS, "-d", "--" })
-        else
-            b.addSystemCommand(&.{ "perf", "stat", "-d", "--" });
-
-        run_perf.has_side_effects = true;
-        run_perf.addArtifactArg(perf_exe);
-
-        const assembly = b.addWriteFiles();
-        _ = assembly.addCopyFile(
-            perf_exe.getEmittedAsm(),
-            b.fmt("{s}.asm", .{@tagName(perf_opt)}),
-        );
-
-        perf_step.dependOn(&run_perf.step);
-        perf_step.dependOn(&assembly.step);
     }
 
     const dummy = b.addTest(.{
